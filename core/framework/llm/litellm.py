@@ -8,11 +8,15 @@ See: https://docs.litellm.ai/docs/providers
 """
 
 import json
+from collections.abc import Callable
 from typing import Any
 
-import litellm
+try:
+    import litellm
+except ImportError:
+    litellm = None
 
-from framework.llm.provider import LLMProvider, LLMResponse, Tool, ToolUse
+from framework.llm.provider import LLMProvider, LLMResponse, Tool, ToolResult, ToolUse
 
 
 class LiteLLMProvider(LLMProvider):
@@ -72,12 +76,19 @@ class LiteLLMProvider(LLMProvider):
         self.api_base = api_base
         self.extra_kwargs = kwargs
 
+        if litellm is None:
+            raise ImportError(
+                "LiteLLM is not installed. Please install it with: pip install litellm"
+            )
+
     def complete(
         self,
         messages: list[dict[str, Any]],
         system: str = "",
         tools: list[Tool] | None = None,
         max_tokens: int = 1024,
+        response_format: dict[str, Any] | None = None,
+        json_mode: bool = False,
     ) -> LLMResponse:
         """Generate a completion using LiteLLM."""
         # Prepare messages with system prompt
@@ -85,6 +96,15 @@ class LiteLLMProvider(LLMProvider):
         if system:
             full_messages.append({"role": "system", "content": system})
         full_messages.extend(messages)
+
+        # Add JSON mode via prompt engineering (works across all providers)
+        if json_mode:
+            json_instruction = "\n\nPlease respond with a valid JSON object."
+            # Append to system message if present, otherwise add as system message
+            if full_messages and full_messages[0]["role"] == "system":
+                full_messages[0]["content"] += json_instruction
+            else:
+                full_messages.insert(0, {"role": "system", "content": json_instruction.strip()})
 
         # Build kwargs
         kwargs: dict[str, Any] = {
@@ -102,6 +122,11 @@ class LiteLLMProvider(LLMProvider):
         # Add tools if provided
         if tools:
             kwargs["tools"] = [self._tool_to_openai_format(t) for t in tools]
+
+        # Add response_format for structured output
+        # LiteLLM passes this through to the underlying provider
+        if response_format:
+            kwargs["response_format"] = response_format
 
         # Make the call
         response = litellm.completion(**kwargs)
@@ -128,7 +153,7 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         system: str,
         tools: list[Tool],
-        tool_executor: callable,
+        tool_executor: Callable[[ToolUse], ToolResult],
         max_iterations: int = 10,
     ) -> LLMResponse:
         """Run a tool-use loop until the LLM produces a final response."""
@@ -183,21 +208,23 @@ class LiteLLMProvider(LLMProvider):
 
             # Process tool calls.
             # Add assistant message with tool calls.
-            current_messages.append({
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in message.tool_calls
-                ],
-            })
+            current_messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in message.tool_calls
+                    ],
+                }
+            )
 
             # Execute tools and add results.
             for tool_call in message.tool_calls:
@@ -216,11 +243,13 @@ class LiteLLMProvider(LLMProvider):
                 result = tool_executor(tool_use)
 
                 # Add tool result message
-                current_messages.append({
-                    "role": "tool",
-                    "tool_call_id": result.tool_use_id,
-                    "content": result.content,
-                })
+                current_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": result.tool_use_id,
+                        "content": result.content,
+                    }
+                )
 
         # Max iterations reached
         return LLMResponse(
